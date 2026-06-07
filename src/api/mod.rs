@@ -48,7 +48,7 @@ impl ApiClient {
         let temperature: f32 = std::env::var("TEMPERATURE")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(0.6);
+            .unwrap_or(0.3);
 
         let request = ChatRequest {
             model: self.settings.api.get_model_id(&self.settings.model),
@@ -92,7 +92,7 @@ impl ApiClient {
         let temperature: f32 = std::env::var("TEMPERATURE")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(0.6);
+            .unwrap_or(0.3);
 
         let request = ChatRequest {
             model: self.settings.api.get_model_id(&self.settings.model),

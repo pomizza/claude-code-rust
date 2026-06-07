@@ -100,7 +100,7 @@ impl Repl {
         let temperature: f32 = std::env::var("TEMPERATURE")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(0.6);
+            .unwrap_or(0.3);
 
         // 工具调用循环
         loop {
