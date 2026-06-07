@@ -97,6 +97,11 @@ impl Repl {
         // 获取工具定义
         let tools = self.get_tool_definitions();
 
+        let temperature: f32 = std::env::var("TEMPERATURE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.6);
+
         // 工具调用循环
         loop {
             // Show typing indicator
@@ -111,8 +116,8 @@ impl Repl {
                 "model": model,
                 "messages": messages,
                 "max_tokens": max_tokens,
-                "stream": false,
-                "temperature": 0.7
+                "stream": true,
+                "temperature": temperature
             });
 
             // 注入工具定义
@@ -120,7 +125,11 @@ impl Repl {
                 request_body["tools"] = serde_json::to_value(&tools)?;
             }
 
-            let http_client = reqwest::blocking::Client::new();
+            let timeout_secs = self.state.settings.api.timeout;
+            let http_client = reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(timeout_secs))
+                .build()
+                .unwrap_or_default();
             let url = format!("{}/v1/chat/completions", base_url);
 
             let resp = match http_client
@@ -144,118 +153,146 @@ impl Repl {
                 return Ok(());
             }
 
-            let json: serde_json::Value = resp.json().unwrap_or(serde_json::json!({}));
+            // Parse SSE stream and accumulate response
+            let body_text = resp.text().unwrap_or_default();
+            let mut full_content = String::new();
+            let mut tool_calls_map: std::collections::HashMap<usize, (String, String, String, String)> = std::collections::HashMap::new();
+            let mut usage_prompt: u64 = 0;
+            let mut usage_completion: u64 = 0;
 
-            if let Some(choices) = json.get("choices").and_then(|c| c.as_array()) {
-                if let Some(choice) = choices.first() {
-                    let message = choice.get("message");
+            for line in body_text.lines() {
+                let line = line.trim();
+                if !line.starts_with("data: ") {
+                    continue;
+                }
+                let data = &line[6..];
+                if data == "[DONE]" {
+                    break;
+                }
+                let chunk: serde_json::Value = match serde_json::from_str(data) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
 
-                    // 检查是否有工具调用
-                    let tool_calls = message
-                        .and_then(|m| m.get("tool_calls"))
-                        .and_then(|tc| tc.as_array())
-                        .cloned();
+                if let Some(choices) = chunk.get("choices").and_then(|c| c.as_array()) {
+                    for choice in choices {
+                        let delta = match choice.get("delta") {
+                            Some(d) => d,
+                            None => continue,
+                        };
 
-                    if let Some(calls) = tool_calls {
-                        if !calls.is_empty() {
-                            // 打印工具调用信息
-                            println!();
-                            for call in &calls {
-                                if let Some(func) = call.get("function") {
-                                    let tool_name = func.get("name")
-                                        .and_then(|n| n.as_str())
-                                        .unwrap_or("unknown");
-                                    println!("  {} Executing tool: {}",
-                                        "🔧".truecolor(255, 200, 100),
-                                        tool_name.cyan().bold()
-                                    );
-                                }
-                            }
-                            println!();
-
-                            // 添加 assistant 消息（带 tool_calls）
-                            let tool_calls_parsed: Vec<ToolCall> = calls.iter().filter_map(|call| {
-                                let id = call.get("id")?.as_str()?.to_string();
-                                let r#type = call.get("type")?.as_str()?.to_string();
-                                let func = call.get("function")?;
-                                let name = func.get("name")?.as_str()?.to_string();
-                                let arguments = func.get("arguments")?.as_str()?.to_string();
-                                Some(ToolCall {
-                                    id,
-                                    r#type,
-                                    function: crate::api::ToolCallFunction {
-                                        name,
-                                        arguments,
-                                    },
-                                })
-                            }).collect();
-
-                            let assistant_msg = ChatMessage {
-                                role: "assistant".to_string(),
-                                content: message.and_then(|m| m.get("content")).and_then(|c| c.as_str()).map(|s| s.to_string()),
-                                tool_calls: Some(tool_calls_parsed),
-                                tool_call_id: None,
-                            };
-                            self.conversation_history.push(assistant_msg);
-
-                            // 执行每个工具调用并添加结果
-                            for call in &calls {
-                                if let (Some(id), Some(func)) = (
-                                    call.get("id").and_then(|i| i.as_str()),
-                                    call.get("function")
-                                ) {
-                                    let tool_name = func.get("name")
-                                        .and_then(|n| n.as_str())
-                                        .unwrap_or("unknown");
-                                    let args_str = func.get("arguments")
-                                        .and_then(|a| a.as_str())
-                                        .unwrap_or("{}");
-
-                                    let args: serde_json::Value = serde_json::from_str(args_str)
-                                        .unwrap_or(serde_json::json!({}));
-
-                                    // 执行工具
-                                    let result = self.execute_tool(tool_name, args);
-
-                                    // 添加工具结果消息
-                                    let tool_result_msg = ChatMessage::tool(id, result);
-                                    self.conversation_history.push(tool_result_msg);
-                                }
-                            }
-
-                            // 继续循环，让 AI 处理工具结果
-                            continue;
+                        // Accumulate content
+                        if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
+                            full_content.push_str(content);
                         }
-                    }
 
-                    // 没有工具调用，处理普通响应
-                    if let Some(content) = message
-                        .and_then(|m| m.get("content"))
-                        .and_then(|c| c.as_str())
-                    {
-                        ui::print_claude_message(content);
-                        self.conversation_history.push(ChatMessage::assistant(content.to_string()));
-
-                        // Print token usage if available
-                        if let Some(usage) = json.get("usage") {
-                            if let (Some(prompt), Some(completion)) = (
-                                usage.get("prompt_tokens").and_then(|t| t.as_u64()),
-                                usage.get("completion_tokens").and_then(|t| t.as_u64()),
-                            ) {
-                                let total = prompt + completion;
-                                println!("  {} {} prompt · {} generated · {} total",
-                                    "◦".truecolor(100, 100, 100),
-                                    prompt.to_string().truecolor(150, 150, 150),
-                                    completion.to_string().truecolor(150, 150, 150),
-                                    total.to_string().truecolor(180, 180, 180)
-                                );
+                        // Accumulate tool_calls
+                        if let Some(tcs) = delta.get("tool_calls").and_then(|t| t.as_array()) {
+                            for tc in tcs {
+                                let idx = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
+                                let entry = tool_calls_map.entry(idx).or_insert_with(|| {
+                                    (String::new(), String::new(), String::new(), String::new())
+                                });
+                                if let Some(id) = tc.get("id").and_then(|i| i.as_str()) {
+                                    entry.0 = id.to_string();
+                                }
+                                if let Some(tp) = tc.get("type").and_then(|t| t.as_str()) {
+                                    entry.1 = tp.to_string();
+                                }
+                                if let Some(func) = tc.get("function") {
+                                    if let Some(name) = func.get("name").and_then(|n| n.as_str()) {
+                                        entry.2 = name.to_string();
+                                    }
+                                    if let Some(args) = func.get("arguments").and_then(|a| a.as_str()) {
+                                        entry.3.push_str(args);
+                                    }
+                                }
                             }
                         }
                     }
                 }
+
+                // Capture usage from final chunk
+                if let Some(usage) = chunk.get("usage") {
+                    if let Some(p) = usage.get("prompt_tokens").and_then(|t| t.as_u64()) {
+                        usage_prompt = p;
+                    }
+                    if let Some(c) = usage.get("completion_tokens").and_then(|t| t.as_u64()) {
+                        usage_completion = c;
+                    }
+                }
             }
 
-            // 退出循环
+            // Process accumulated tool_calls
+            if !tool_calls_map.is_empty() {
+                let mut sorted_calls: Vec<_> = tool_calls_map.into_iter().collect();
+                sorted_calls.sort_by_key(|(idx, _)| *idx);
+
+                // Print tool call info
+                println!();
+                for (_, (_, _, ref name, _)) in &sorted_calls {
+                    if !name.is_empty() {
+                        println!("  {} Executing tool: {}",
+                            "🔧".truecolor(255, 200, 100),
+                            name.cyan().bold()
+                        );
+                    }
+                }
+                println!();
+
+                // Build tool_calls for conversation history
+                let tool_calls_parsed: Vec<ToolCall> = sorted_calls.iter().filter_map(|(_, (id, tp, name, args))| {
+                    if id.is_empty() || name.is_empty() { return None; }
+                    Some(ToolCall {
+                        id: id.clone(),
+                        r#type: if tp.is_empty() { "function".to_string() } else { tp.clone() },
+                        function: crate::api::ToolCallFunction {
+                            name: name.clone(),
+                            arguments: args.clone(),
+                        },
+                    })
+                }).collect();
+
+                let content_for_history = if full_content.is_empty() { None } else { Some(full_content.clone()) };
+                let assistant_msg = ChatMessage {
+                    role: "assistant".to_string(),
+                    content: content_for_history,
+                    tool_calls: Some(tool_calls_parsed),
+                    tool_call_id: None,
+                };
+                self.conversation_history.push(assistant_msg);
+
+                // Execute each tool call
+                for (_, (id, _, name, args_str)) in &sorted_calls {
+                    let args: serde_json::Value = serde_json::from_str(args_str)
+                        .unwrap_or(serde_json::json!({}));
+                    let result = self.execute_tool(name, args);
+                    let tool_result_msg = ChatMessage::tool(id, result);
+                    self.conversation_history.push(tool_result_msg);
+                }
+
+                // Continue loop to let AI process tool results
+                continue;
+            }
+
+            // No tool calls — handle normal response
+            if !full_content.is_empty() {
+                ui::print_claude_message(&full_content);
+                self.conversation_history.push(ChatMessage::assistant(full_content));
+
+                // Print token usage
+                if usage_prompt > 0 || usage_completion > 0 {
+                    let total = usage_prompt + usage_completion;
+                    println!("  {} {} prompt · {} generated · {} total",
+                        "◦".truecolor(100, 100, 100),
+                        usage_prompt.to_string().truecolor(150, 150, 150),
+                        usage_completion.to_string().truecolor(150, 150, 150),
+                        total.to_string().truecolor(180, 180, 180)
+                    );
+                }
+            }
+
+            // Exit loop
             break;
         }
 

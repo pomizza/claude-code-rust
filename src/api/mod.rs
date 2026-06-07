@@ -45,12 +45,17 @@ impl ApiClient {
             .get_api_key()
             .ok_or_else(|| anyhow::anyhow!("API key not configured"))?;
 
+        let temperature: f32 = std::env::var("TEMPERATURE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.6);
+
         let request = ChatRequest {
             model: self.settings.api.get_model_id(&self.settings.model),
             messages,
             max_tokens: self.settings.api.max_tokens,
             stream: false,
-            temperature: 0.7,
+            temperature,
             tools,
         };
 
@@ -84,12 +89,17 @@ impl ApiClient {
             .get_api_key()
             .ok_or_else(|| anyhow::anyhow!("API key not configured"))?;
 
+        let temperature: f32 = std::env::var("TEMPERATURE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.6);
+
         let request = ChatRequest {
             model: self.settings.api.get_model_id(&self.settings.model),
             messages,
             max_tokens: self.settings.api.max_tokens,
             stream: true,
-            temperature: 0.7,
+            temperature,
             tools,
         };
 

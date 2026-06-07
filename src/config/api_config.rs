@@ -27,8 +27,14 @@ impl Default for ApiConfig {
                 .or(std::env::var("DEEPSEEK_API_KEY").ok()),
             base_url: std::env::var("API_BASE_URL")
                 .unwrap_or_else(|_| "https://api.anthropic.com".to_string()),
-            max_tokens: 4096,
-            timeout: 120,
+            max_tokens: std::env::var("MAX_TOKENS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(16384),
+            timeout: std::env::var("API_TIMEOUT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(300),
             streaming: true,
             beta_headers: vec![],
         }
