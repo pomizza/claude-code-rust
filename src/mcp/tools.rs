@@ -6,6 +6,103 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use async_trait::async_trait;
 
+// ─── Lightweight sandbox policy (read from env at startup) ───────────────────
+
+mod sandbox {
+    use std::path::PathBuf;
+    use std::sync::OnceLock;
+
+    pub struct Policy {
+        pub denied_commands: Vec<String>,
+        pub denied_paths: Vec<PathBuf>,
+        pub allowed_paths: Vec<PathBuf>,  // empty = no whitelist (allow all)
+    }
+
+    fn expand_tilde(s: &str) -> PathBuf {
+        if let Some(rest) = s.strip_prefix("~/") {
+            if let Some(home) = std::env::var_os("HOME") {
+                return PathBuf::from(home).join(rest);
+            }
+        } else if s == "~" {
+            if let Some(home) = std::env::var_os("HOME") {
+                return PathBuf::from(home);
+            }
+        }
+        PathBuf::from(s)
+    }
+
+    fn parse_paths(raw: &str) -> Vec<PathBuf> {
+        raw.split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| expand_tilde(s))
+            .collect()
+    }
+
+    static POLICY: OnceLock<Policy> = OnceLock::new();
+
+    fn get_policy() -> &'static Policy {
+        POLICY.get_or_init(|| {
+            let denied_commands_raw = std::env::var("LINGSHU_SANDBOX_DENIED_CMDS")
+                .unwrap_or_else(|_| "sudo,su ,rm -rf /,shutdown,reboot,kill -9 1,launchctl bootout,launchctl remove,chmod 777,mkfs,dd if=".to_string());
+            let denied_paths_raw = std::env::var("LINGSHU_SANDBOX_DENIED_PATHS")
+                .unwrap_or_else(|_| "~/.ssh,~/.gnupg,/etc/passwd,/etc/shadow,~/.config/git/credentials".to_string());
+            let allowed_paths_raw = std::env::var("LINGSHU_SANDBOX_ALLOWED_PATHS")
+                .unwrap_or_default();
+
+            Policy {
+                denied_commands: denied_commands_raw.split(',')
+                    .map(|s| s.trim().to_lowercase())
+                    .filter(|s| !s.is_empty())
+                    .collect(),
+                denied_paths: parse_paths(&denied_paths_raw),
+                allowed_paths: parse_paths(&allowed_paths_raw),
+            }
+        })
+    }
+
+    /// Check if a command is denied. Returns Some(reason) if blocked.
+    pub fn check_command(command: &str) -> Option<String> {
+        let policy = get_policy();
+        let lower = command.to_lowercase();
+        for denied in &policy.denied_commands {
+            if lower.contains(denied.as_str()) {
+                return Some(format!("command denied by sandbox policy: contains '{}'", denied));
+            }
+        }
+        None
+    }
+
+    /// Check if a path is allowed. Returns Some(reason) if blocked.
+    pub fn check_path(raw_path: &str) -> Option<String> {
+        let policy = get_policy();
+        let path = expand_tilde(raw_path);
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
+
+        // Check denied paths
+        for denied in &policy.denied_paths {
+            if canonical.starts_with(denied) || path.starts_with(denied) {
+                return Some(format!("path denied by sandbox policy: '{}' is under protected path '{}'",
+                    raw_path, denied.display()));
+            }
+        }
+
+        // Check allowed paths whitelist (if configured)
+        if !policy.allowed_paths.is_empty() {
+            let allowed = policy.allowed_paths.iter().any(|a| {
+                canonical.starts_with(a) || path.starts_with(a)
+            });
+            if !allowed {
+                return Some(format!("path denied by sandbox policy: '{}' is not under any allowed path", raw_path));
+            }
+        }
+
+        None
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpTool {
     pub name: String,
@@ -161,6 +258,14 @@ impl ToolExecutor for BuiltinFileReadExecutor {
     async fn execute(&self, params: serde_json::Value) -> anyhow::Result<serde_json::Value> {
         let path = params["path"].as_str()
             .ok_or_else(|| anyhow::anyhow!("Missing path parameter"))?;
+
+        // Sandbox: check path policy
+        if let Some(reason) = sandbox::check_path(path) {
+            return Ok(serde_json::json!({
+                "success": false,
+                "error": reason
+            }));
+        }
         
         let content = tokio::fs::read_to_string(path).await
             .map_err(|e| anyhow::anyhow!("Failed to read file: {}", e))?;
@@ -181,6 +286,14 @@ impl ToolExecutor for BuiltinFileWriteExecutor {
             .ok_or_else(|| anyhow::anyhow!("Missing path parameter"))?;
         let content = params["content"].as_str()
             .ok_or_else(|| anyhow::anyhow!("Missing content parameter"))?;
+
+        // Sandbox: check path policy
+        if let Some(reason) = sandbox::check_path(path) {
+            return Ok(serde_json::json!({
+                "success": false,
+                "error": reason
+            }));
+        }
         
         if let Some(parent) = std::path::Path::new(path).parent() {
             tokio::fs::create_dir_all(parent).await
@@ -205,6 +318,14 @@ impl ToolExecutor for BuiltinCommandExecutor {
         let command = params["command"].as_str()
             .ok_or_else(|| anyhow::anyhow!("Missing command parameter"))?;
         let cwd = params["cwd"].as_str();
+
+        // Sandbox: check command policy
+        if let Some(reason) = sandbox::check_command(command) {
+            return Ok(serde_json::json!({
+                "success": false,
+                "error": reason
+            }));
+        }
 
         // Windows 用 cmd /C，Unix 用 sh -c
         let output = if cfg!(target_os = "windows") {
@@ -315,5 +436,53 @@ impl ToolExecutor for BuiltinSearchExecutor {
                 "error": e.to_string()
             }))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sandbox;
+
+    #[test]
+    fn test_sandbox_denies_sudo() {
+        let result = sandbox::check_command("sudo rm -rf /tmp/foo");
+        assert!(result.is_some(), "sudo should be denied");
+        assert!(result.unwrap().contains("sudo"));
+    }
+
+    #[test]
+    fn test_sandbox_denies_reboot() {
+        let result = sandbox::check_command("reboot now");
+        assert!(result.is_some(), "reboot should be denied");
+    }
+
+    #[test]
+    fn test_sandbox_allows_normal_commands() {
+        let result = sandbox::check_command("ls -la /tmp");
+        assert!(result.is_none(), "ls should be allowed");
+
+        let result = sandbox::check_command("git status");
+        assert!(result.is_none(), "git should be allowed");
+
+        let result = sandbox::check_command("python3 script.py");
+        assert!(result.is_none(), "python should be allowed");
+    }
+
+    #[test]
+    fn test_sandbox_denies_ssh_path() {
+        let result = sandbox::check_path("~/.ssh/id_rsa");
+        assert!(result.is_some(), "~/.ssh should be denied");
+    }
+
+    #[test]
+    fn test_sandbox_denies_etc_passwd() {
+        let result = sandbox::check_path("/etc/passwd");
+        assert!(result.is_some(), "/etc/passwd should be denied");
+    }
+
+    #[test]
+    fn test_sandbox_allows_normal_path() {
+        let result = sandbox::check_path("/tmp/test.txt");
+        assert!(result.is_none(), "/tmp should be allowed");
     }
 }
