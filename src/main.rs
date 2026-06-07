@@ -14,7 +14,13 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let settings = Settings::load()?;
+    let mut settings = Settings::load()?;
+
+    // CLI -m overrides settings.model (unless default "sonnet")
+    if cli.model != "sonnet" || std::env::args().any(|a| a == "-m" || a == "--model") {
+        settings.model = cli.model.clone();
+    }
+
     let state = AppState::new(settings);
 
     match cli.run_async(state).await {
